@@ -1,0 +1,27 @@
+parameters:
+  - name: RESOURCE_GROUP
+  - name: service_conn
+  - name: location
+
+jobs:
+  - job: CheckResourceNames
+    displayName: 'Check Resource Names'
+    steps:
+      - task: AzureCLI@2
+        displayName: 'Check or Create Resource Group'
+        inputs:
+          azureSubscription: '${{ parameters.service_conn }}'
+          scriptType: 'bash'
+          scriptLocation: 'inlineScript'
+          inlineScript: |
+            echo "Checking if resource group '${{ parameters.RESOURCE_GROUP }}' exists..."
+            # Using --only-show-errors to suppress the initial 'Please run az login' error if any
+            exists=$(az group exists --name ${{ parameters.RESOURCE_GROUP }})
+            echo "az returned: $exists"
+            if [ "$exists" = "false" ]; then
+              echo "##[warning] Resource group does not exist. Creating it now..."
+              # You'll need to specify a location for the resource group creation
+              az group create --name ${{ parameters.RESOURCE_GROUP }} --location ${{ parameters.location }} --only-show-errors
+            else
+              echo "Resource group exists."
+            fi

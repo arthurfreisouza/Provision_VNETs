@@ -1,0 +1,175 @@
+trigger: none
+
+parameters:
+  - name: location
+    type: string
+    default: 'westus'
+  - name: RESOURCE_GROUP
+    type: string
+    default: 'vnetProjArthur'
+  - name: templateVNET
+    type: string
+    default: 'provision/bicep_files/VNET_provision.bicep'
+
+variables:
+  - group: Arthur_VG
+
+stages:
+  - stage: CheckResources
+    displayName: 'Check Initial Resource Names Stage'
+    jobs:
+      - template: 1_checking_names/check-resource-names.yml
+        parameters:
+          RESOURCE_GROUP: ${{ parameters.RESOURCE_GROUP }}
+          service_conn: '$(service_conn)'
+          location: ${{ parameters.location }}
+  - stage: Lint
+    displayName: 'Lint Bicep Code'
+    jobs:
+    - job: LintBicep
+      displayName: 'Lint Bicep File'
+      steps:
+      - script: az bicep build --file ${{ parameters.templateVNET }}
+        displayName: 'Lint VNet Bicep Template'
+
+  - stage: ValidateDeployment
+    displayName: 'Validate Bicep Deployment'
+    jobs:
+    - job: ValidateBicep
+      displayName: 'Validate Bicep Template'
+      steps:
+      - task: AzureCLI@2
+        displayName: 'Validate VNet Bicep Template'
+        inputs:
+          azureSubscription: '$(service_conn)'
+          scriptType: 'bash'
+          scriptLocation: 'inlineScript'
+          inlineScript: |
+            echo "Validating Bicep deployment..."
+            az deployment group validate \
+              --resource-group ${{ parameters.RESOURCE_GROUP }} \
+              --template-file ${{ parameters.templateVNET }} \
+              --debug
+
+  - stage: WhatIfOperation
+    displayName: 'Run What-If Deployment'
+    jobs:
+    - job: WhatIfJob
+      displayName: 'What-If for VNet Deployment'
+      steps:
+      - task: AzureCLI@2
+        displayName: 'What-If for VNet Template'
+        inputs:
+          azureSubscription: '$(service_conn)'
+          scriptType: 'bash'
+          scriptLocation: 'inlineScript'
+          inlineScript: |
+            echo "Running What-If for VNet deployment..."
+            az deployment group what-if \
+              --resource-group ${{ parameters.RESOURCE_GROUP }} \
+              --template-file ${{ parameters.templateVNET }}
+
+  - stage: Deploy
+    displayName: 'Deploy VNet Resources'
+    jobs:
+    - job: DeployResources
+      displayName: 'Deploy VNet Environment'
+      steps:
+      - task: AzureCLI@2
+        displayName: 'Deploy Bicep Template'
+        name: 'bicepDeployment'
+        inputs:
+          azureSubscription: '$(service_conn)'
+          scriptType: 'bash'
+          scriptLocation: 'inlineScript'
+          inlineScript: |
+            echo "🚀 Deploying VNet resources..."
+            deployment_output=$(az deployment group create \
+              --resource-group "${{ parameters.RESOURCE_GROUP }}" \
+              --template-file "${{ parameters.templateVNET }}" \
+              --output json)
+
+            if [ $? -ne 0 ]; then
+              echo "##[error]Bicep deployment failed."
+              exit 1
+            fi
+
+            APP_VNET_NAME=$(echo "$deployment_output" | jq -r '.properties.outputs.appVnetName.value')
+            HUB_VNET_NAME=$(echo "$deployment_output" | jq -r '.properties.outputs.hubVnetName.value')
+            echo "App VNet Name: $APP_VNET_NAME"
+            echo "Hub VNet Name: $HUB_VNET_NAME"
+
+            # CORRECTED: Consistent directory name (plural)
+            mkdir -p $(Pipeline.Workspace)/bicep_outputs
+            
+            # CORRECTED: Write to the correct directory
+            echo "$APP_VNET_NAME" > $(Pipeline.Workspace)/bicep_outputs/appVnetName.txt
+            echo "$HUB_VNET_NAME" > $(Pipeline.Workspace)/bicep_outputs/hubVnetName.txt
+
+      - task: PublishPipelineArtifact@1
+        displayName: 'Publish Bicep Outputs as Artifact'
+        inputs:
+          # CORRECTED: Path now matches the directory created above
+          targetPath: '$(Pipeline.Workspace)/bicep_outputs'
+          artifact: 'bicep_outputs'
+
+  - stage: SmokeTest
+    displayName: 'Smoke Test Deployed VNet'
+    dependsOn: Deploy
+    condition: succeeded()
+    jobs:
+    - job: SmokeTestJob
+      displayName: 'Check VNet Resources'
+      steps:
+      - task: DownloadPipelineArtifact@2
+        displayName: 'Download Bicep Outputs Artifact'
+        inputs:
+          artifactName: 'bicep_outputs'
+          downloadPath: '$(Pipeline.Workspace)/bicep_outputs'
+
+      - task: AzureCLI@2
+        displayName: 'Verify VNets and Peering Status'
+        inputs:
+          azureSubscription: '$(service_conn)'
+          scriptType: 'bash'
+          scriptLocation: 'inlineScript'
+          inlineScript: |
+            echo "--- 🔬 Starting Smoke Test ---"
+            
+            # CORRECTED: The read path is now correct.
+            # The download task places files directly in the downloadPath.
+            APP_VNET_NAME=$(cat $(Pipeline.Workspace)/bicep_outputs/appVnetName.txt)
+            HUB_VNET_NAME=$(cat $(Pipeline.Workspace)/bicep_outputs/hubVnetName.txt)
+
+            if [ -z "$APP_VNET_NAME" ] || [ -z "$HUB_VNET_NAME" ]; then
+              echo "##[error]🔥 Could not read VNet names from artifact files."
+              exit 1
+            fi
+
+            echo "Checking for App VNet: $APP_VNET_NAME"
+            if ! az network vnet show --name "$APP_VNET_NAME" --resource-group "${{ parameters.RESOURCE_GROUP }}" > /dev/null; then
+              echo "##[error]🔥 App VNet '$APP_VNET_NAME' not found."
+              exit 1
+            fi
+            echo "✅ SUCCESS: App VNet '$APP_VNET_NAME' found."
+
+            echo "Checking for Hub VNet: $HUB_VNET_NAME"
+            if ! az network vnet show --name "$HUB_VNET_NAME" --resource-group "${{ parameters.RESOURCE_GROUP }}" > /dev/null; then
+              echo "##[error]🔥 Hub VNet '$HUB_VNET_NAME' not found."
+              exit 1
+            fi
+            echo "✅ SUCCESS: Hub VNet '$HUB_VNET_NAME' found."
+
+            echo "Verifying peering status from App VNet to Hub VNet..."
+            PEERING_STATUS=$(az network vnet peering show \
+              --name app-vnet-to-hub \
+              --resource-group "${{ parameters.RESOURCE_GROUP }}" \
+              --vnet-name "$APP_VNET_NAME" \
+              --query "peeringState" -o tsv)
+
+            if [ "$PEERING_STATUS" == "Connected" ]; then
+              echo "✅ SUCCESS: Peering is 'Connected'."
+            else
+              echo "##[error]🔥 Peering status is '$PEERING_STATUS', expected 'Connected'."
+              exit 1
+            fi
